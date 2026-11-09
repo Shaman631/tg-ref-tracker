@@ -2,7 +2,7 @@
 # Render → New → Blueprint → репозиторий Shaman631/tg-ref-tracker → этот файл.
 services:
   - type: web
-    name: tg-ref-tracker
+    name: tg-ref-tracker-php
     runtime: docker
     plan: free
     healthCheckPath: /health
