@@ -49,6 +49,19 @@ def mock_call(method, payload=None):
         return json.loads(resp.read().decode("utf-8"))["result"]
 
 
+def wait_for_sent(count, timeout=25.0):
+    """Ждём, пока бот отправит нужное число сообщений (вместо фиксированной паузы)."""
+    deadline = time.time() + timeout
+    last = 0
+    while time.time() < deadline:
+        sent = mock_call("__sent")
+        last = len(sent)
+        if last >= count:
+            return sent
+        time.sleep(0.4)
+    raise AssertionError(f"бот не отправил сообщений: ждали {count}, пришло {last}")
+
+
 try:
     run(["init"])
     run(["config", "set", "chat", "999888"])
@@ -126,6 +139,48 @@ try:
         except subprocess.TimeoutExpired:
             bot.kill()
         print("Windows: SIGTERM не доставляется, проверка graceful-остановки пропущена")
+
+    print("\n=== 9. управление с телефона: команда /daily и кнопка ===")
+    bot_log = open(WORK / "bot_phone.log", "w", encoding="utf-8")
+    phone = subprocess.Popen([sys.executable, "tg_ref.py", "bot"], cwd=WORK, env=env,
+                              stdout=bot_log, stderr=subprocess.STDOUT)
+    time.sleep(3)
+    before = len(mock_call("__sent"))
+
+    # 1) команда /daily с телефона
+    mock_call("__push_update", {"update": {"update_id": 900, "message": {
+        "chat": {"id": 777, "type": "private"}, "text": "/daily"}}})
+    sent = wait_for_sent(before + 1)
+    reply = sent[-1]
+    assert "Итого за день" in reply["text"], reply["text"]
+    assert reply.get("reply_markup"), "нет инлайн-кнопок в ответе"
+    print("команда /daily: отчёт с кнопками отправлен ✅")
+
+    # 2) нажатие инлайн-кнопки «Отчёт»
+    mock_call("__push_update", {"update": {"update_id": 901, "callback_query": {
+        "id": "cb1", "data": "stats",
+        "message": {"chat": {"id": 777, "type": "private"}, "text": ""}}}})
+    sent = wait_for_sent(before + 2)
+    assert "Итого за день" in sent[-1]["text"], sent[-1]["text"]
+    print("нажатие кнопки «Отчёт»: отчёт отправлен ✅")
+
+    print("\n=== 10. /status и /restart с телефона ===")
+    mock_call("__push_update", {"update": {"update_id": 902, "message": {
+        "chat": {"id": 777, "type": "private"}, "text": "/status"}}})
+    sent = wait_for_sent(before + 3)
+    assert "Состояние трекера" in sent[-1]["text"], sent[-1]["text"]
+    print("/status: сводка отправлена ✅")
+
+    mock_call("__push_update", {"update": {"update_id": 903, "message": {
+        "chat": {"id": 777, "type": "private"}, "text": "/restart"}}})
+    sent = wait_for_sent(before + 4)
+    assert "Перезапускаю бота" in sent[-1]["text"], sent[-1]["text"]
+    try:
+        phone.wait(timeout=20)
+        print("/restart: бот корректно завершился, его поднимет watchdog ✅")
+    except subprocess.TimeoutExpired:
+        phone.kill()
+        raise AssertionError("бот не завершился после /restart")
 
     print("\n✅ ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ")
 finally:

@@ -3,6 +3,7 @@
 import json
 import re
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 STATE = {
@@ -10,6 +11,7 @@ STATE = {
     "members": {"-100111": 1000, "-100222": 500},
     "sent": [],
     "counter": 0,
+    "updates": [],
 }
 LOCK = threading.Lock()
 
@@ -62,9 +64,23 @@ class Handler(BaseHTTPRequestHandler):
                 STATE["sent"].append(payload)
                 return self._send({"message_id": len(STATE["sent"])})
             if method == "getUpdates":
-                return self._send([])
+                off = int(payload.get("offset") or 0)
+                ups = [u for u in STATE["updates"] if int(u.get("update_id", 0)) >= off]
+                STATE["updates"] = []
+                if not ups:
+                    time.sleep(0.5)   # чтобы бот не крутил цикл впустую
+                return self._send(ups)
+            if method == "__push_update":
+                upd = payload.get("update") or {}
+                upd.setdefault("update_id", STATE["counter"] + 1)
+                STATE["counter"] = int(upd["update_id"])
+                STATE["updates"].append(upd)
+                return self._send({"queued": len(STATE["updates"])})
             if method == "__sent":
                 return self._send(STATE["sent"])
+            if method == "__dump":
+                return self._send({"updates": STATE["updates"], "counter": STATE["counter"],
+                                   "sent": len(STATE["sent"])})
             if method == "__add_joins":
                 for link in STATE["links"].values():
                     link["join_count"] += int(payload.get("n", 0))

@@ -530,10 +530,13 @@ def build_report_plain(data: dict) -> str:
     return "\n".join(lines)
 
 
-def send_message(chat_id: str, text: str, html_mode: bool = True) -> None:
+def send_message(chat_id: str, text: str, html_mode: bool = True,
+                 reply_markup: dict | None = None) -> None:
     payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
     if html_mode:
         payload["parse_mode"] = "HTML"
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     api_call("sendMessage", payload)
 
 
@@ -552,12 +555,108 @@ def resolve_report_chat(cfg: dict, override: str | None = None) -> str:
 def bot_commands_help() -> str:
     return (
         "Команды бота:\n"
+        "/daily — полный цикл: создать ссылки + собрать статистику + отчёт\n"
+        "/stats — собрать и прислать отчёт прямо сейчас\n"
         "/links — ссылки дня по каналам\n"
         "/newlinks — создать ссылки дня вручную\n"
-        "/stats — собрать и прислать отчёт прямо сейчас\n"
+        "/status — состояние системы (аптайм, ближайший запуск, последний отчёт)\n"
+        "/restart — перезапустить бота (поднимет watchdog)\n"
         "/channels — список каналов и статус прав\n"
-        "/help — эта справка"
+        "/help — эта справка\n\n"
+        "Кнопки ниже делают то же самое — можно пользоваться с телефона."
     )
+
+
+def main_keyboard() -> dict:
+    """Инлайн-кнопки — управление трекером с телефона."""
+    return {
+        "inline_keyboard": [
+            [{"text": "🌙 Полный цикл", "callback_data": "daily"},
+             {"text": "📊 Отчёт", "callback_data": "stats"}],
+            [{"text": "🔗 Ссылки дня", "callback_data": "links"},
+             {"text": "🆕 Создать ссылки", "callback_data": "newlinks"}],
+        ]
+    }
+
+
+def build_status_text(cfg: dict, state: dict) -> str:
+    """Сводка для команды /status — что с системой прямо сейчас."""
+    now = now_tz(cfg)
+    conn = db()
+    last = conn.execute(
+        "SELECT * FROM job_runs ORDER BY date DESC LIMIT 1").fetchone()
+    links = conn.execute("SELECT COUNT(*) AS c FROM links").fetchone()["c"]
+    conn.close()
+
+    hh, mm = parse_time_hm(cfg.get("schedule_time") or "21:00")
+    # now — с часовым поясом, поэтому и следующий запуск строим в той же зоне
+    today_run = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    next_run = today_run if now < today_run else today_run + dt.timedelta(days=1)
+
+    started = state.get("started_at")
+    uptime = "—"
+    if started:
+        delta = dt.datetime.now() - started
+        mins = int(delta.total_seconds() // 60)
+        uptime = f"{mins // 60} ч {mins % 60} мин"
+
+    lines = [
+        "<b>Состояние трекера</b>",
+        f"• Сейчас: {now.strftime('%d.%m.%Y %H:%M')} ({cfg.get('timezone')})",
+        f"• Бот работает: {uptime}",
+        f"• Ближайший автозапуск: {next_run.strftime('%d.%m.%Y %H:%M')}",
+        f"• Каналов в работе: {len(configured_channels(cfg))}",
+        f"• Создано ссылок всего: {links}",
+    ]
+    if last:
+        lines.append(f"• Последняя задача: {last['date']} — {last['status']}, "
+                     f"отчёт: {last['report_sent_at'] or 'не отправлен'}")
+    lines.append("\n" + bot_commands_help())
+    return "\n".join(lines)
+
+
+def handle_bot_callback(callback: dict, cfg: dict, state: dict) -> None:
+    """Обработка нажатий на инлайн-кнопки."""
+    data = callback.get("data") or ""
+    chat = (callback.get("message") or {}).get("chat", {})
+    chat_id = str(chat.get("id"))
+    today = now_tz(cfg).date().isoformat()
+
+    try:
+        if data == "daily":
+            create_links(cfg, today, verbose=False)
+            report = collect_stats(cfg, today)
+            send_message(chat_id, build_report_text(report), reply_markup=main_keyboard())
+        elif data == "stats":
+            report = collect_stats(cfg, today)
+            send_message(chat_id, build_report_text(report), reply_markup=main_keyboard())
+        elif data == "links":
+            conn = db()
+            rows = []
+            for ch in configured_channels(cfg):
+                r = link_for(conn, str(ch["chat_id"]), today)
+                rows.append(f"• {channel_label(ch)}: {r['invite_link'] if r else '— нет ссылки —'}")
+            conn.close()
+            send_message(chat_id, f"Ссылки на {today}:\n\n" + "\n".join(rows) if rows else "Каналы не настроены.",
+                         reply_markup=main_keyboard())
+        elif data == "newlinks":
+            created = create_links(cfg, today, verbose=False)
+            text_out = "\n".join(f"• {c['channel_label']}: {c['invite_link']}" for c in created)
+            send_message(chat_id,
+                         f"Ссылки на {today} созданы:\n\n{text_out}" if created else "Новых ссылок нет (уже созданы).",
+                         reply_markup=main_keyboard())
+        else:
+            send_message(chat_id, bot_commands_help())
+    except TelegramError as exc:
+        try:
+            send_message(chat_id, f"Ошибка: {exc}")
+        except TelegramError:
+            pass
+    finally:
+        try:
+            api_call("answerCallbackQuery", {"callback_query_id": callback.get("id", "")})
+        except TelegramError:
+            pass
 
 
 def handle_bot_update(update: dict, cfg: dict, state: dict) -> None:
@@ -576,13 +675,20 @@ def handle_bot_update(update: dict, cfg: dict, state: dict) -> None:
             conn.commit()
         return
 
+    if "callback_query" in update:
+        conn.close()
+        handle_bot_callback(update["callback_query"], cfg, state)
+        return
+
     msg = update.get("message") or update.get("edited_message")
     if not msg:
+        conn.close()
         return
     text = (msg.get("text") or "").strip()
     chat = msg.get("chat", {})
     chat_id = str(chat.get("id"))
     if not text.startswith("/"):
+        conn.close()
         return
 
     cmd = text.split()[0].split("@")[0].lower()
@@ -596,6 +702,7 @@ def handle_bot_update(update: dict, cfg: dict, state: dict) -> None:
                 f"Ваш chat_id: <code>{chat_id}</code>\n"
                 f"Укажите его в config.json (report_chat_id), чтобы получать отчёты сюда.\n\n"
                 + bot_commands_help(),
+                reply_markup=main_keyboard(),
             )
         elif cmd == "/links":
             rows = []
@@ -604,22 +711,38 @@ def handle_bot_update(update: dict, cfg: dict, state: dict) -> None:
                 r = link_for(conn2, str(ch["chat_id"]), today)
                 rows.append(f"• {channel_label(ch)}: {r['invite_link'] if r else '— нет ссылки —'}")
             conn2.close()
-            send_message(chat_id, f"Ссылки на {today}:\n\n" + "\n".join(rows) if rows else "Каналы не настроены.")
+            send_message(chat_id, f"Ссылки на {today}:\n\n" + "\n".join(rows) if rows else "Каналы не настроены.",
+                         reply_markup=main_keyboard())
         elif cmd == "/newlinks":
             created = create_links(cfg, today, verbose=False)
             text_out = "\n".join(f"• {c['channel_label']}: {c['invite_link']}" for c in created)
-            send_message(chat_id, f"Ссылки на {today} созданы:\n\n{text_out}" if created else "Новых ссылок нет (уже созданы).")
+            send_message(chat_id, f"Ссылки на {today} созданы:\n\n{text_out}" if created else "Новых ссылок нет (уже созданы).",
+                         reply_markup=main_keyboard())
         elif cmd == "/stats":
             data = collect_stats(cfg, today)
-            send_message(chat_id, build_report_text(data))
+            send_message(chat_id, build_report_text(data), reply_markup=main_keyboard())
+        elif cmd == "/daily":
+            create_links(cfg, today, verbose=False)
+            data = collect_stats(cfg, today)
+            send_message(chat_id, build_report_text(data), reply_markup=main_keyboard())
+        elif cmd == "/status":
+            send_message(chat_id, build_status_text(cfg, state), reply_markup=main_keyboard())
+        elif cmd == "/restart":
+            send_message(chat_id,
+                         "🔄 Перезапускаю бота. Watchdog поднимет его в течение минуты.\n"
+                         "Команды, отправленные пока бот был выключен, Telegram хранит "
+                         "и выполнит сразу после запуска — до 24 часов.",
+                         reply_markup=main_keyboard())
+            state["restart"] = True
         elif cmd == "/channels":
             lines = []
             for ch in configured_channels(cfg):
                 status, rights = bot_status_in_channel(str(ch["chat_id"]), state["bot_id"])
                 lines.append(f"• {channel_label(ch)} — {status}, {rights}")
-            send_message(chat_id, "Каналы:\n\n" + "\n".join(lines) if lines else "Каналы не настроены.")
+            send_message(chat_id, "Каналы:\n\n" + "\n".join(lines) if lines else "Каналы не настроены.",
+                         reply_markup=main_keyboard())
         elif cmd == "/help":
-            send_message(chat_id, bot_commands_help())
+            send_message(chat_id, bot_commands_help(), reply_markup=main_keyboard())
     except TelegramError as exc:
         try:
             send_message(chat_id, f"Ошибка: {exc}")
@@ -648,6 +771,7 @@ def cmd_bot(cfg: dict) -> None:
                 pass
 
     offset = None
+    state = {"bot_id": me["id"], "started_at": dt.datetime.now(), "restart": False}
     try:
         while True:
             payload: dict = {"timeout": 45}
@@ -657,9 +781,12 @@ def cmd_bot(cfg: dict) -> None:
             for upd in updates or []:
                 offset = int(upd["update_id"]) + 1
                 try:
-                    handle_bot_update(upd, cfg, {"bot_id": me["id"]})
+                    handle_bot_update(upd, cfg, state)
                 except Exception as exc:  # не роняем бота из-за одной команды
                     warn(f"Ошибка обработки апдейта: {exc}")
+            if state.get("restart"):
+                log("Перезапуск по команде /restart")
+                break
     except KeyboardInterrupt:
         log("\nОстановлено.")
     finally:
@@ -926,6 +1053,13 @@ def cmd_daily(cfg: dict, args) -> None:
         dates = [args.date or now.date().isoformat()]
 
     for date_str in dates:
+        conn = db()
+        row = conn.execute("SELECT report_sent_at FROM job_runs WHERE date=?",
+                           (date_str,)).fetchone()
+        conn.close()
+        if row and row["report_sent_at"] and not getattr(args, "force", False):
+            log(f"Отчёт за {date_str} уже отправлен — повторно не слать.")
+            continue
         run_daily_job(cfg, date_str, args)
 
 
