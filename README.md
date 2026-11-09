@@ -37,25 +37,43 @@
 > Локально ничего настраивать не нужно: папка проекта — это просто исходники, которые
 > заливаются на хостинг. Локальное задание планировщика MiniMax Code на 21:00 приостановлено.
 
-### Шаг 1. Залейте файлы на сервер
+### Шаг 1. Получите проект на сервере
 
-Через SSH, SFTP или файловый менеджер панели положите папку в домашний каталог, например
-`/home/USER/tg`. Должно получиться:
+Два способа — выберите любой.
 
+#### Способ А: через deploy key (рекомендуется)
+
+Проект лежит в приватном репозитории `Shaman631/tg-ref-tracker`. Скрипт создаст на сервере
+SSH-ключ, покажет его публичную часть и подскажет, куда её вставить. Дальше обновления
+делаются одной командой `git pull`.
+
+```bash
+cd /home/USER/tg          # если папки нет — положите туда только deploy/setup-git.sh
+chmod +x deploy/setup-git.sh
+./deploy/setup-git.sh /home/USER/tg
 ```
-/home/USER/tg/
-├── tg_ref.py
-├── config.json          ← заполнить (см. шаг 3)
-├── config.example.json
-├── reflinks.db          ← создастся сам
-├── deploy/
-│   ├── daily.sh
-│   ├── botctl.sh
-│   ├── check.sh
-│   └── cron.txt
-├── logs/                ← создастся сам
-└── selftest/            ← можно не заливать
+
+Скрипт:
+
+1. создаст ключ `~/.ssh/tg_ref_deploy` (если его ещё нет);
+2. добавит `github.com` в `known_hosts`;
+3. проверит доступ к GitHub и, если ключ ещё не зарегистрирован, покажет его и ссылку —
+   https://github.com/Shaman631/tg-ref-tracker/settings/keys/new
+   (вставить публичный ключ, галочку *Allow write access* можно не ставить — нужен доступ на чтение);
+4. после того как вы добавили ключ в GitHub, повторите `./deploy/setup-git.sh /home/USER/tg` —
+   он склонирует проект, создаст `config.json` из шаблона и выставит права.
+
+#### Способ Б: архивом
+
+Если SSH-доступ к GitHub с сервера неудобен — залейте `tg-ref-deploy.zip` через файловый
+менеджер панели и распакуйте:
+
+```bash
+cd /home/USER && unzip tg-ref-deploy.zip && cd tg-ref-tracker
+cp config.example.json config.json
 ```
+
+В обоих случаях дальше идёт одинаково:
 
 ```bash
 cd /home/USER/tg
@@ -211,6 +229,8 @@ python3 tg_ref.py config set schedule 20:00
 | `reflinks.db` | SQLite: ссылки, снапшоты join_count, дневная статистика |
 | `deploy/daily.sh` | запуск ежедневной задачи (из cron) |
 | `deploy/botctl.sh` | управление фоновым ботом: start/stop/status/logs/ensure |
+| `deploy/setup-git.sh` | deploy key: создание ключа, клонирование проекта с GitHub |
+| `deploy/update.sh` | обновление проекта (git pull + перезапуск бота + проверка) |
 | `deploy/check.sh` | проверка окружения и настроек |
 | `deploy/cron.txt` | готовые строки для cron в панели |
 | `selftest/` | офлайн-проверка на моке Telegram API (без токена) |
@@ -222,8 +242,19 @@ python3 tg_ref.py config set schedule 20:00
 
 ## Обновление на сервере
 
+Если проект ставился через deploy key:
+
 ```bash
 cd /home/USER/tg
+./deploy/update.sh
+```
+
+Скрипт выполнит `git pull`, перезапустит бота и проверит настройки. `config.json`,
+`reflinks.db` и `logs/` в `.gitignore` — ваши настройки и статистика не затрагиваются.
+
+Если проект заливался архивом — замените файлы вручную и перезапустите бота:
+
+```bash
 ./deploy/botctl.sh stop
 # заменить tg_ref.py новой версией
 ./deploy/check.sh
