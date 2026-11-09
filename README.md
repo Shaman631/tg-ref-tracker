@@ -32,6 +32,32 @@
 
 ---
 
+## Локальный запуск на Windows
+
+Для пробного запуска на своём компьютере (PowerShell):
+
+```powershell
+cd E:\tg
+python tg_ref.py config set token <ТОКЕН>
+python tg_ref.py config set chat <ВАШ_CHAT_ID>
+python tg_ref.py channels add @ваш_канал
+python tg_ref.py setup          # проверка прав
+python tg_ref.py daily --send   # создать ссылки и прислать отчёт
+```
+
+Фоновый бот на Windows — отдельной запускалкой:
+
+```powershell
+deploy\botctl.cmd start    # запустить (своё окно "tg-ref-bot")
+deploy\botctl.cmd status   # проверить
+deploy\botctl.cmd stop     # остановить
+```
+
+Ежедневный запуск в 21:00 настраивается задачей планировщика MiniMax Code
+(она уже создана для папки `E:\tg`) — на сервере её заменяет cron из панели.
+
+---
+
 ## Развёртывание на хостинге (shared hosting / панель)
 
 > Локально ничего настраивать не нужно: папка проекта — это просто исходники, которые
