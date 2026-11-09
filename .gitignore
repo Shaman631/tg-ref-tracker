@@ -12,6 +12,13 @@ logs/
 .bot.pid
 tg-ref-deploy.zip
 
+# CI: файл workflow нельзя залить OAuth-токеном без scope "workflow".
+# Когда расширите scope — уберите эту строку и сделайте: git add -f .github/workflows/selftest.yml
+.github/
+
+# Временные каталоги селф-теста
+selftest/_work*/
+
 # Python
 __pycache__/
 *.py[cod]
