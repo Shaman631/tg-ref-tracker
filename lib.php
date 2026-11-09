@@ -367,7 +367,8 @@ function handleUpdate(array $u): void
         if ($cmd === '/start') {
             sendMessage($chat, "👋 Трекер реферальных ссылок.\n\n"
                 . "Команды:\n/daily — создать ссылки дня и прислать отчёт\n"
-                . "/links — ссылки дня\n/status — состояние\n\n"
+                . "/links — ссылки дня\n/status — состояние\n"
+                . "/webkey — ключ доступа к веб-странице\n\n"
                 . "Ваш chat_id: <code>{$chat}</code> — его же укажите в CHAT_ID.");
         } elseif ($cmd === '/daily') {
             $res = runDaily(today(), true);
@@ -384,6 +385,14 @@ function handleUpdate(array $u): void
                 $lines[] = '• ' . $c . ': ' . ($link ?: '— нет —');
             }
             sendMessage($chat, implode("\n", $lines));
+        } elseif ($cmd === '/webkey') {
+            $key = webKey();
+            $public = trim((string) (env('PUBLIC_URL') ?? env('RENDER_EXTERNAL_URL') ?? ''));
+            $public = rtrim($public, '/');
+            $url = $public !== '' ? $public . '/?key=' . $key : '/?key=' . $key;
+            sendMessage($chat, "🔑 Ключ доступа к веб-странице управления\n\n"
+                . "<code>{$key}</code>\n\nСтраница: {$url}\n\n"
+                . "Сохраните ссылку в закладки телефона.");
         } elseif ($cmd === '/status') {
             $state = readState();
             $last = '';

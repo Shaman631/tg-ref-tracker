@@ -139,6 +139,16 @@ try:
     assert len(state["channels"]) == 2, state
     print(f"state.json: каналов {len(state['channels'])}, отчёт {list(state['days'])[0]} ✅")
 
+    print("\n=== 6. команда /webkey ===")
+    mock_call("__push_update", {"update": {"update_id": 12, "message": {
+        "chat": {"id": 777, "type": "private"}, "text": "/webkey"}}})
+    sent = wait_for(lambda: (mock_call("__sent") if any("Ключ доступа" in m.get("text", "")
+                                                     for m in mock_call("__sent")) else None))
+    assert sent, "/webkey не ответил"
+    key_msg = [m for m in sent if "Ключ доступа" in m.get("text", "")][-1]["text"]
+    assert "testkey" in key_msg, key_msg
+    print("/webkey: ключ отправлен ✅")
+
     print("\n✅ ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ")
 finally:
     for p in (worker, web):
