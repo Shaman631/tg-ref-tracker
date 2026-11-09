@@ -1,0 +1,44 @@
+# Blueprint для Render: один бесплатный Web Service со всем функционалом.
+#
+# Подключение: Render → New → Blueprint → указать репозиторий и этот файл.
+# Значения sync: false нужно заполнить вручную после создания.
+
+services:
+  - type: web
+    name: tg-ref-tracker
+    runtime: python
+    plan: free
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: python tg_ref.py serve
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: TG_BOT_TOKEN
+        sync: false        # токен от @BotFather
+      - key: TG_REPORT_CHAT_ID
+        sync: false        # ваш chat_id, бот ответит на /start
+      - key: TG_CHANNELS
+        sync: false        # например: @my_channel,@second_channel
+      - key: TG_WEB_KEY
+        sync: false        # необязательно: если пусто, ключ выводится из токена
+                           # и не меняется при перезапусках
+      - key: TG_SCHEDULE_TIME
+        value: "21:00"
+      - key: TG_TIMEZONE
+        value: Europe/Samara
+      - key: TG_BACKUP_CHAT_ID
+        sync: false        # чат для бэкапа базы (обычно тот же, что и report_chat_id)
+      - key: TG_PUBLIC_URL
+        sync: false        # необязательно: Render сам подставляет RENDER_EXTERNAL_URL
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+# Постоянный диск — только на платных планах (free web service диск не подключить).
+# Раскомментируйте, если перейдёте на Starter ($7/мес): история переживёт редеплой.
+#
+#     disk:
+#       name: data
+#       mountPath: /var/data
+#       sizeGB: 1
+#
+# и добавьте переменную: TG_REF_DB=/var/data/reflinks.db

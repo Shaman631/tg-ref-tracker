@@ -4,6 +4,7 @@ import json
 import re
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 STATE = {
@@ -81,7 +82,15 @@ class Handler(BaseHTTPRequestHandler):
         if "multipart/form-data" in ctype:
             return self._handle_multipart(raw, ctype)
 
-        payload = json.loads(raw or b"{}")
+        try:
+            payload = json.loads(raw or b"{}")
+            if not isinstance(payload, dict):
+                payload = {}
+        except json.JSONDecodeError:
+            # PHP присылает application/x-www-form-urlencoded
+            payload = {}
+            for k, v in urllib.parse.parse_qsl(raw.decode("utf-8", "replace")):
+                payload[k] = v
         m = re.search(r"/bot[^/]+/(\w+)$", self.path)
         method = m.group(1) if m else ""
         with LOCK:

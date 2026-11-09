@@ -2,11 +2,9 @@
 .github
 __pycache__
 *.pyc
-selftest
+python
+php-selftest.py
+mock_bot_api.py
+state.json
 logs
-config.json
-reflinks.db
-*.db-journal
 tg-ref-deploy.zip
-deploy
-README.md

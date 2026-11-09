@@ -1,22 +1,19 @@
-# Трекер реферальных ссылок Telegram — образ для Render (и любого Docker-хостинга).
-# Зависимостей нет: образ основан на чистом Python.
-FROM python:3.12-slim
+# Трекер реферальных ссылок Telegram — PHP-версия для Render.
+FROM php:8.3-cli
 
 WORKDIR /app
+COPY index.php worker.php lib.php ./
 
-COPY tg_ref.py ./
-COPY config.example.json ./
-COPY requirements.txt ./
-
-RUN mkdir -p /app/logs
-
-ENV PYTHONUNBUFFERED=1 \
+RUN mkdir -p /data
+ENV STATE_FILE=/data/state.json \
     PORT=8080 \
-    TZ=Europe/Samara
+    TZ=Europe/Samara \
+    PHP_CLI_SERVER_WORKERS=4
 
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-    CMD python -c "import urllib.request,os; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8080')+'/health', timeout=4)"
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s \
+    CMD php -r "exit(@file_get_contents('http://127.0.0.1:' . (getenv('PORT') ?: 8080) . '/health') === false ? 1 : 0);"
 
-CMD ["python", "tg_ref.py", "serve"]
+# Два процесса: веб-сервис и воркер (он же следит за расписанием)
+CMD ["sh", "-c", "php -S 0.0.0.0:${PORT:-8080} index.php & exec php worker.php"]

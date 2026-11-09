@@ -312,18 +312,49 @@ CREATE TABLE IF NOT EXISTS job_runs (
 """
 
 
+_SCHEMA_READY = False
+# Кэш состояния для /health: чтобы проверка живости не трогала базу и не блокировалась
+HEALTH_CACHE: dict = {"links_total": 0, "last_job": None, "bot_alive": False,
+                      "updated": None, "bot_last_poll": None}
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(SCHEMA)
+    conn.commit()
+
+
 def db() -> sqlite3.Connection:
+    global _SCHEMA_READY
     parent = DB_PATH.parent
     if parent and not parent.exists():
         try:
             parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             warn(f"Не удалось создать каталог для базы ({parent}): {exc}")
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
-    conn.commit()
+    conn.execute("PRAGMA busy_timeout=10000")
+    if not _SCHEMA_READY or not DB_PATH.exists():
+        try:
+            ensure_schema(conn)
+            _SCHEMA_READY = True
+        except sqlite3.OperationalError as exc:
+            warn(f"Схема базы: {exc}")
     return conn
+
+
+def refresh_health_cache() -> None:
+    """Обновляет кэш для /health. Ошибки не пробрасываются — health не должен падать."""
+    try:
+        conn = db()
+        last = conn.execute("SELECT * FROM job_runs ORDER BY date DESC LIMIT 1").fetchone()
+        links = conn.execute("SELECT COUNT(*) AS c FROM links").fetchone()["c"]
+        conn.close()
+        HEALTH_CACHE["links_total"] = links
+        HEALTH_CACHE["last_job"] = dict(last) if last else None
+        HEALTH_CACHE["updated"] = dt.datetime.now().isoformat(timespec="seconds")
+    except Exception as exc:
+        HEALTH_CACHE["error"] = str(exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -1365,6 +1396,7 @@ def export_state() -> dict:
 def import_state(data: dict) -> int:
     """Восстанавливает состояние из бэкапа. Возвращает число записей."""
     conn = db()
+    ensure_schema(conn)
     total = 0
     for table in ("links", "daily_stats", "job_runs"):
         rows = data.get(table) or []
@@ -1533,7 +1565,10 @@ def bot_loop(cfg: dict, state: dict) -> None:
             payload["offset"] = offset
         try:
             updates = api_call("getUpdates", payload)
+            HEALTH_CACHE["bot_alive"] = True
+            HEALTH_CACHE["bot_last_poll"] = dt.datetime.now().isoformat(timespec="seconds")
         except TelegramError as exc:
+            HEALTH_CACHE["bot_alive"] = False
             warn(f"Ошибка long polling: {exc}")
             time.sleep(5)
             continue
@@ -1721,14 +1756,7 @@ def today_links(cfg: dict) -> list[dict]:
 
 
 def health_payload(cfg: dict) -> dict:
-    try:
-        conn = db()
-        last = conn.execute("SELECT * FROM job_runs ORDER BY date DESC LIMIT 1").fetchone()
-        links = conn.execute("SELECT COUNT(*) AS c FROM links").fetchone()["c"]
-        conn.close()
-        last_job = dict(last) if last else None
-    except Exception as exc:
-        last_job, links = None, 0
+    """Ответ /health. Базу не трогаем — берём кэш, чтобы проверка была мгновенной."""
     return {
         "ok": True,
         "time": now_tz(cfg).isoformat(timespec="seconds"),
@@ -1737,8 +1765,10 @@ def health_payload(cfg: dict) -> dict:
         "backup_chat_set": bool((cfg.get("backup_chat_id") or "").strip()),
         "schedule_time": cfg.get("schedule_time"),
         "channels": len(configured_channels(cfg)),
-        "links_total": links,
-        "last_job": last_job,
+        "bot_alive": bool(HEALTH_CACHE.get("bot_alive")),
+        "links_total": HEALTH_CACHE.get("links_total", 0),
+        "last_job": HEALTH_CACHE.get("last_job"),
+        "cache_updated": HEALTH_CACHE.get("updated"),
     }
 
 
@@ -1806,6 +1836,14 @@ def cmd_serve(cfg: dict, args) -> None:
         threads.append(t)
         log("⏰ Планировщик запущен")
 
+    def cache_loop():
+        while not WebHandler.stop_event.is_set():
+            refresh_health_cache()
+            WebHandler.stop_event.wait(20)
+
+    threading.Thread(target=cache_loop, daemon=True).start()
+    refresh_health_cache()
+
     httpd = ThreadingHTTPServer(("0.0.0.0", port), WebHandler)
     log(f"🌐 Служаю 0.0.0.0:{port}")
     log(f"🔑 Ключ доступа: {key}")
@@ -1836,6 +1874,14 @@ def cmd_worker(cfg: dict, args) -> None:
     state = {"bot_id": me["id"], "started_at": dt.datetime.now(), "restart": False}
     stop_event = threading.Event()
     threading.Thread(target=scheduler_loop, args=(cfg, stop_event), daemon=True).start()
+
+    def cache_loop():
+        while not stop_event.is_set():
+            refresh_health_cache()
+            stop_event.wait(20)
+
+    threading.Thread(target=cache_loop, daemon=True).start()
+    refresh_health_cache()
     log(f"🤖 Бот @{me['username']} запущен, планировщик работает")
     try:
         bot_loop(cfg, state)

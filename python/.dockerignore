@@ -1,0 +1,12 @@
+.git
+.github
+__pycache__
+*.pyc
+selftest
+logs
+config.json
+reflinks.db
+*.db-journal
+tg-ref-deploy.zip
+deploy
+README.md

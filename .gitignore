@@ -5,6 +5,7 @@ config.json
 # Данные прогона
 reflinks.db
 *.db-journal
+state.json
 logs/
 *.log
 
@@ -16,8 +17,9 @@ tg-ref-deploy.zip
 # Когда расширите scope — уберите эту строку и сделайте: git add -f .github/workflows/selftest.yml
 .github/
 
-# Временные каталоги селф-теста
-selftest/_work*/
+# Временные каталоги селф-тестов
+_work*/
+python/selftest/_work*/
 
 # Python
 __pycache__/
