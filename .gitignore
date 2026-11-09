@@ -1,0 +1,19 @@
+# Настройки и секреты — токен бота и chat_id
+config.json
+.env
+
+# Данные прогона
+reflinks.db
+*.db-journal
+logs/
+*.log
+
+# Служебное
+.bot.pid
+tg-ref-deploy.zip
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

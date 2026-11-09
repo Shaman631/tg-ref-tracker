@@ -1,0 +1,33 @@
+{
+  "_комментарий": "Скопируйте этот файл как config.json на хостинг и заполните значения. bot_token можно задать переменной окружения TG_BOT_TOKEN — тогда в файл его класть не нужно.",
+
+  "bot_token": "123456789:AA-замените-на-реальный-токен",
+
+  "_report_chat_id": "Ваш личный chat_id (напишите боту /start) либо id канала для отчётов (-100...)",
+  "report_chat_id": "",
+
+  "_timezone": "Часовой пояс для определения «сегодня» и времени задачи. Europe/Samara = UTC+4",
+  "timezone": "Europe/Samara",
+
+  "_utc_offset": "Запасной вариант, если на сервере нет zoneinfo: смещение в часах",
+  "utc_offset": 4,
+
+  "_schedule_time": "Во сколько создавать ссылки и слать отчёт (ЧЧ:ММ)",
+  "schedule_time": "21:00",
+
+  "_member_limit": "Максимум участников на одну ссылку (0 = без лимита)",
+  "member_limit": 0,
+
+  "_link_expire_hours": "Срок жизни ссылки в часах (0 = бессрочно)",
+  "link_expire_hours": 0,
+
+  "_channels": "Список каналов. Заполните вручную или командой: python3 tg_ref.py channels add @username",
+  "channels": [
+    {
+      "chat_id": "@example_channel",
+      "title": "Пример канала",
+      "username": "example_channel",
+      "enabled": true
+    }
+  ]
+}
