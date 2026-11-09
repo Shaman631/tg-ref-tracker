@@ -12,6 +12,8 @@ STATE = {
     "sent": [],
     "counter": 0,
     "updates": [],
+    "files": {},      # file_id -> bytes
+    "description": "",
 }
 LOCK = threading.Lock()
 
@@ -28,14 +30,67 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_GET(self):
+        # скачивание файла: /file/bot<token>/<path>
+        if self.path.startswith("/file/"):
+            fid = self.path.rsplit("/", 1)[-1]
+            with LOCK:
+                blob = STATE["files"].get(fid)
+            if blob is None:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(blob)))
+            self.end_headers()
+            self.wfile.write(blob)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def _handle_multipart(self, raw: bytes, ctype: str):
+        """Принимает файл (multipart) и сохраняет его содержимое."""
+        bm = re.search(r"boundary=([^;]+)", ctype)
+        boundary = ("--" + bm.group(1)) if bm else None
+        fields = {}
+        file_id = "mockfile1"
+        blob = b""
+        if boundary:
+            parts = raw.split(boundary.encode())
+            for part in parts:
+                if b"filename=" not in part:
+                    continue
+                head, _, body = part.partition(b"\r\n\r\n")
+                blob = body.rsplit(b"\r\n", 1)[0]
+                fname = re.search(rb'filename="([^"]+)"', head)
+                with LOCK:
+                    STATE["files"][file_id] = blob
+                    STATE["sent"].append({"method": "sendDocument", "file_name":
+                                          (fname.group(1).decode() if fname else ""),
+                                          "size": len(blob)})
+        return self._send({"message_id": 1,
+                           "document": {"file_id": file_id,
+                                        "file_name": "tg_ref_state.json.gz"}})
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        payload = json.loads(self.rfile.read(length) or b"{}")
+        raw = self.rfile.read(length) if length else b""
+        ctype = self.headers.get("Content-Type", "")
+
+        if "multipart/form-data" in ctype:
+            return self._handle_multipart(raw, ctype)
+
+        payload = json.loads(raw or b"{}")
         m = re.search(r"/bot[^/]+/(\w+)$", self.path)
         method = m.group(1) if m else ""
         with LOCK:
             if method == "getMe":
-                return self._send({"id": 42, "username": "test_ref_bot", "first_name": "Test"})
+                return self._send({"id": 42, "username": "test_ref_bot", "first_name": "Test",
+                                   "description": STATE["description"]})
+            if method == "setMyDescription":
+                STATE["description"] = payload.get("description", "")
+                return self._send(True)
             if method == "getChat":
                 cid = str(payload.get("chat_id"))
                 if cid not in STATE["members"]:
@@ -63,6 +118,9 @@ class Handler(BaseHTTPRequestHandler):
             if method == "sendMessage":
                 STATE["sent"].append(payload)
                 return self._send({"message_id": len(STATE["sent"])})
+            if method == "sendDocument":
+                STATE["sent"].append(payload)
+                return self._send({"message_id": len(STATE["sent"])})
             if method == "getUpdates":
                 off = int(payload.get("offset") or 0)
                 ups = [u for u in STATE["updates"] if int(u.get("update_id", 0)) >= off]
@@ -76,6 +134,9 @@ class Handler(BaseHTTPRequestHandler):
                 STATE["counter"] = int(upd["update_id"])
                 STATE["updates"].append(upd)
                 return self._send({"queued": len(STATE["updates"])})
+            if method == "getFile":
+                fid = payload.get("file_id")
+                return self._send({"file_id": fid, "file_path": f"mock/{fid}"})
             if method == "__sent":
                 return self._send(STATE["sent"])
             if method == "__dump":

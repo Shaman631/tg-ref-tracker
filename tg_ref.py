@@ -29,24 +29,30 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import gzip
 import html
 import json
 import os
 import re
+import secrets
 import signal
 import sqlite3
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
-DB_PATH = BASE_DIR / "reflinks.db"
 # TG_API_BASE позволяет указать локальный Bot API сервер или прокси:
 # TG_API_BASE="http://127.0.0.1:8081/bot{token}/{method}"
 API_BASE = os.environ.get("TG_API_BASE", "https://api.telegram.org/bot{token}/{method}")
+# Путь к базе можно переопределить (на Render — на persistent disk: /var/data/reflinks.db)
+DB_PATH = Path(os.environ.get("TG_REF_DB") or (BASE_DIR / "reflinks.db"))
 
 DEFAULT_TZ = "Europe/Samara"
 FALLBACK_UTC_OFFSET_HOURS = 4  # Самара GMT+4, без перехода на летнее время
@@ -54,6 +60,8 @@ FALLBACK_UTC_OFFSET_HOURS = 4  # Самара GMT+4, без перехода н�
 DEFAULT_CONFIG = {
     "bot_token": "",
     "report_chat_id": "",
+    "backup_chat_id": "",
+    "web_key": "",
     "timezone": DEFAULT_TZ,
     "utc_offset": FALLBACK_UTC_OFFSET_HOURS,
     "schedule_time": "21:00",
@@ -104,6 +112,56 @@ def load_config() -> dict:
                 cfg.update(data)
         except json.JSONDecodeError as exc:
             die(f"config.json повреждён: {exc}")
+    return apply_env(cfg)
+
+
+def apply_env(cfg: dict) -> dict:
+    """Переменные окружения важнее файла config.json — так настраивается на Render."""
+    env = os.environ.get
+
+    token = (env("TG_BOT_TOKEN") or "").strip()
+    if token:
+        cfg["bot_token"] = token
+
+    chat_id = (env("TG_REPORT_CHAT_ID") or "").strip()
+    if chat_id:
+        cfg["report_chat_id"] = chat_id
+
+    channels = (env("TG_CHANNELS") or "").strip()
+    if channels:
+        parsed = []
+        for name in channels.replace(";", ",").split(","):
+            name = name.strip()
+            if not name:
+                continue
+            if not name.startswith("@") and not name.startswith("-"):
+                name = "@" + name
+            parsed.append({"chat_id": name, "title": name, "username": name.lstrip("@"),
+                           "enabled": True})
+        if parsed:
+            cfg["channels"] = parsed
+
+    for env_key, cfg_key in (("TG_SCHEDULE_TIME", "schedule_time"),
+                             ("TG_TIMEZONE", "timezone"),
+                             ("TG_MEMBER_LIMIT", "member_limit"),
+                             ("TG_LINK_EXPIRE_HOURS", "link_expire_hours"),
+                             ("TG_UTC_OFFSET", "utc_offset"),
+                             ("TG_WEB_KEY", "web_key"),
+                             ("TG_BACKUP_CHAT_ID", "backup_chat_id")):
+        val = env(env_key)
+        if val is None or val == "":
+            continue
+        if cfg_key in ("member_limit", "link_expire_hours", "utc_offset"):
+            try:
+                cfg[cfg_key] = int(val)
+            except ValueError:
+                warn(f"{env_key}={val!r} не число — игнорирую")
+        else:
+            cfg[cfg_key] = val.strip()
+
+    if not cfg.get("report_chat_id"):
+        # на Render отчёты можно слать в ту же приватную переписку с ботом
+        cfg["report_chat_id"] = cfg.get("report_chat_id") or ""
     return cfg
 
 
@@ -255,6 +313,12 @@ CREATE TABLE IF NOT EXISTS job_runs (
 
 
 def db() -> sqlite3.Connection:
+    parent = DB_PATH.parent
+    if parent and not parent.exists():
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            warn(f"Не удалось создать каталог для базы ({parent}): {exc}")
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
@@ -684,9 +748,24 @@ def handle_bot_update(update: dict, cfg: dict, state: dict) -> None:
     if not msg:
         conn.close()
         return
-    text = (msg.get("text") or "").strip()
     chat = msg.get("chat", {})
     chat_id = str(chat.get("id"))
+
+    # присланный файл бэкапа → восстановление состояния
+    doc = msg.get("document") or {}
+    if doc.get("file_name", "").endswith("tg_ref_state.json.gz"):
+        conn.close()
+        try:
+            file_info = api_call("getFile", {"file_id": doc["file_id"]})
+            blob = api_download((file_info or {}).get("file_path", ""))
+            data = json.loads(gzip.decompress(blob).decode("utf-8"))
+            n = import_state(data)
+            send_message(chat_id, f"✅ Состояние восстановлено, записей: {n}")
+        except Exception as exc:
+            send_message(chat_id, f"❌ Не удалось восстановить: {exc}")
+        return
+
+    text = (msg.get("text") or "").strip()
     if not text.startswith("/"):
         conn.close()
         return
@@ -773,20 +852,7 @@ def cmd_bot(cfg: dict) -> None:
     offset = None
     state = {"bot_id": me["id"], "started_at": dt.datetime.now(), "restart": False}
     try:
-        while True:
-            payload: dict = {"timeout": 45}
-            if offset is not None:
-                payload["offset"] = offset
-            updates = api_call("getUpdates", payload)
-            for upd in updates or []:
-                offset = int(upd["update_id"]) + 1
-                try:
-                    handle_bot_update(upd, cfg, state)
-                except Exception as exc:  # не роняем бота из-за одной команды
-                    warn(f"Ошибка обработки апдейта: {exc}")
-            if state.get("restart"):
-                log("Перезапуск по команде /restart")
-                break
+        bot_loop(cfg, state)
     except KeyboardInterrupt:
         log("\nОстановлено.")
     finally:
@@ -1275,6 +1341,476 @@ def subprocess_start_bot() -> None:
         warn(f"Не удалось запустить бота: {exc}")
 
 
+def export_state() -> dict:
+    """Выгружает содержимое базы в словарь (для бэкапа)."""
+    conn = db()
+    out = {}
+    for table in ("links", "daily_stats", "job_runs"):
+        out[table] = [dict(r) for r in conn.execute(f"SELECT * FROM {table}").fetchall()]
+    conn.close()
+    return out
+
+
+def import_state(data: dict) -> int:
+    """Восстанавливает состояние из бэкапа. Возвращает число записей."""
+    conn = db()
+    total = 0
+    for table in ("links", "daily_stats", "job_runs"):
+        rows = data.get(table) or []
+        if not rows:
+            continue
+        cols = list(rows[0].keys())
+        placeholders = ",".join("?" * len(cols))
+        conn.executemany(
+            f"INSERT OR REPLACE INTO {table} ({','.join(cols)}) VALUES ({placeholders})",
+            [tuple(r.get(c) for c in cols) for r in rows],
+        )
+        total += len(rows)
+    conn.commit()
+    conn.close()
+    return total
+
+
+def api_upload(method: str, fields: dict, filename: str, content: bytes) -> object:
+    """Отправляет файл в Telegram (multipart/form-data вручную, без сторонних библиотек)."""
+    token = get_token(load_config())
+    url = API_BASE.format(token=token, method=method)
+    boundary = "----tgref" + os.urandom(12).hex()
+    chunks = []
+    for key, value in fields.items():
+        chunks.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode()
+        )
+    chunks.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="document"; '
+        f'filename="{filename}"\r\nContent-Type: application/json\r\n\r\n'.encode()
+    )
+    chunks.append(content)
+    chunks.append(f"\r\n--{boundary}--\r\n".encode())
+    body = b"".join(chunks)
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            raise TelegramError(f"{method}: HTTP {exc.code}") from exc
+    if not data.get("ok"):
+        raise TelegramError(f"{method}: {data.get('description')}")
+    return data.get("result")
+
+
+def api_download(file_path: str) -> bytes:
+    token = get_token(load_config())
+    # база берётся из API_BASE, чтобы работало и с локальным Bot API сервером
+    base = API_BASE.split("/bot")[0].rstrip("/")
+    url = f"{base}/file/bot{token}/{file_path}"
+    try:
+        with urllib.request.urlopen(url, timeout=120) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        raise TelegramError(f"скачивание файла: HTTP {exc.code}") from exc
+
+
+def backup_state(cfg: dict) -> str | None:
+    """Сохраняет состояние базы файлом в Telegram-чат. Возвращает file_id."""
+    chat_id = (cfg.get("backup_chat_id") or cfg.get("report_chat_id") or "").strip()
+    if not chat_id or not token_present(cfg):
+        return None
+    payload = json.dumps(export_state(), ensure_ascii=False).encode("utf-8")
+    blob = gzip.compress(payload, 9)
+    try:
+        res = api_upload("sendDocument", {"chat_id": chat_id, "caption":
+                          "Бэкап состояния трекера реферальных ссылок"}, "tg_ref_state.json.gz", blob)
+    except TelegramError as exc:
+        warn(f"Бэкап не отправлен: {exc}")
+        return None
+    file_id = (res or {}).get("document", {}).get("file_id")
+    if file_id:
+        set_backup_pointer(cfg, file_id)
+    return file_id
+
+
+def set_backup_pointer(cfg: dict, file_id: str) -> None:
+    """Прячет указатель на последний бэкап в описании профиля бота."""
+    try:
+        api_call("setMyDescription", {"description": f"tgref:{file_id}"[:140]})
+    except TelegramError as exc:
+        warn(f"Не удалось сохранить указатель бэкапа: {exc}")
+
+
+def get_backup_pointer(cfg: dict) -> str | None:
+    try:
+        me = get_me()
+    except TelegramError:
+        return None
+    desc = me.get("description") or ""
+    if desc.startswith("tgref:"):
+        return desc[len("tgref:"):].strip() or None
+    return None
+
+
+def restore_state(cfg: dict) -> int:
+    """Восстанавливает состояние из последнего бэкапа, если база пустая."""
+    conn = db()
+    has_rows = conn.execute("SELECT COUNT(*) AS c FROM job_runs").fetchone()["c"]
+    conn.close()
+    if has_rows:
+        return 0
+    file_id = get_backup_pointer(cfg)
+    if not file_id:
+        return 0
+    try:
+        file_info = api_call("getFile", {"file_id": file_id})
+        file_path = (file_info or {}).get("file_path")
+        if not file_path:
+            return 0
+        blob = api_download(file_path)
+        data = json.loads(gzip.decompress(blob).decode("utf-8"))
+        return import_state(data)
+    except (TelegramError, OSError, ValueError, json.JSONDecodeError) as exc:
+        warn(f"Восстановление не удалось: {exc}")
+        return 0
+
+
+def cmd_backup(cfg: dict, args) -> None:
+    file_id = backup_state(cfg)
+    if file_id:
+        log(f"✅ Бэкап отправлен, file_id: {file_id}")
+    else:
+        warn("Бэкап не отправлен: проверьте backup_chat_id / report_chat_id и токен")
+
+
+def cmd_restore(cfg: dict, args) -> None:
+    n = restore_state(cfg)
+    if n:
+        log(f"✅ Восстановлено записей: {n}")
+    else:
+        log("Восстанавливать нечего: база не пуста или бэкап не найден.")
+
+
+def run_daily_guard(cfg: dict, date_str: str, force: bool = False) -> str:
+    """Запускает ежедневную задачу, если отчёт за эту дату ещё не уходил."""
+    conn = db()
+    row = conn.execute("SELECT report_sent_at FROM job_runs WHERE date=?", (date_str,)).fetchone()
+    conn.close()
+    if row and row["report_sent_at"] and not force:
+        return "already_sent"
+
+    args = argparse.Namespace(date=date_str, no_send=False, no_create=False,
+                              force=force, chat=None, if_due=False)
+    run_daily_job(cfg, date_str, args)
+    try:
+        backup_state(cfg)
+    except Exception as exc:
+        warn(f"Бэкап не удался: {exc}")
+    return "done"
+
+
+def bot_loop(cfg: dict, state: dict) -> None:
+    """Цикл long polling: читает команды из Telegram."""
+    offset = None
+    while not state.get("stop"):
+        payload: dict = {"timeout": 45}
+        if offset is not None:
+            payload["offset"] = offset
+        try:
+            updates = api_call("getUpdates", payload)
+        except TelegramError as exc:
+            warn(f"Ошибка long polling: {exc}")
+            time.sleep(5)
+            continue
+        for upd in updates or []:
+            offset = int(upd["update_id"]) + 1
+            try:
+                handle_bot_update(upd, cfg, state)
+            except Exception as exc:  # не роняем бота из-за одной команды
+                warn(f"Ошибка обработки апдейта: {exc}")
+        if state.get("restart"):
+            log("Перезапуск по команде /restart")
+            return
+
+
+def scheduler_loop(cfg: dict, stop_event: threading.Event) -> None:
+    """Внутренний планировщик: сам решает, наступило ли время ежедневной задачи."""
+    while not stop_event.is_set():
+        try:
+            for date_str in due_dates(cfg, now_tz(cfg)):
+                log(f"Планировщик: задача за {date_str} наступила")
+                run_daily_guard(cfg, date_str)
+        except Exception as exc:
+            warn(f"Ошибка планировщика: {exc}")
+        stop_event.wait(60)
+
+
+WEB_PAGE = """<!doctype html>
+<html lang="ru"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Трекер реферальных ссылок</title>
+<style>
+  body{font-family:-apple-system,Roboto,"Segoe UI",sans-serif;background:#0f1720;color:#e6edf3;
+       margin:0;padding:20px;max-width:520px;margin-inline:auto}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:#8b98a5;font-size:13px;margin-bottom:18px}
+  button{display:block;width:100%;padding:16px;margin-bottom:12px;border:0;border-radius:12px;
+         font-size:16px;font-weight:600;background:#2563eb;color:#fff}
+  button.alt{background:#1f2937}
+  button.green{background:#059669}
+  #out{margin-top:16px;padding:14px;border-radius:12px;background:#111c26;font-size:14px;
+       white-space:pre-wrap;word-break:break-word;display:none}
+  a{color:#60a5fa}
+  .foot{margin-top:22px;font-size:12px;color:#6b7a88}
+</style></head><body>
+<h1>Трекер реферальных ссылок</h1>
+<div class="sub">Управление с телефона</div>
+<button class="green" onclick="post('/api/run')">🌙 Полный цикл — создать ссылки и прислать отчёт</button>
+<button onclick="post('/api/stats')">📊 Отчёт прямо сейчас</button>
+<button class="alt" onclick="post('/api/links')">🔗 Ссылки дня</button>
+<button class="alt" onclick="post('/api/status')">ℹ️ Состояние системы</button>
+<div id="out"></div>
+<div class="foot">Отчёты также приходят в Telegram. В боте доступны команды
+<a href="#">/daily</a>, <a href="#">/stats</a>, <a href="#">/status</a>, <a href="#">/restart</a>.</div>
+<script>
+async function post(url){
+  const box=document.getElementById('out'); box.style.display='block'; box.textContent='Выполняю…';
+  try{
+    const r=await fetch(url,{method:'POST'});
+    const t=await r.text();
+    let data; try{data=JSON.parse(t)}catch(e){data={result:t}}
+    box.textContent = data.report || data.result || data.error || t;
+  }catch(e){ box.textContent='Ошибка: '+e; }
+}
+</script>
+</body></html>"""
+
+KEY_PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ключ доступа</title>
+<style>body{font-family:-apple-system,Roboto,sans-serif;background:#0f1720;color:#e6edf3;
+padding:24px;max-width:420px;margin-inline:auto}input,button{width:100%;padding:14px;
+border-radius:12px;border:0;font-size:16px;margin-top:10px}button{background:#2563eb;color:#fff;
+font-weight:600;margin-top:16px}</style></head><body>
+<h3>Введите ключ доступа</h3>
+<form method="get"><input type="password" name="key" placeholder="ключ" autofocus>
+<button>Открыть</button></form></body></html>"""
+
+
+class WebHandler(BaseHTTPRequestHandler):
+    server_version = "tg-ref/1.0"
+    cfg: dict = {}
+    key: str = ""
+    state: dict = {}
+    stop_event: threading.Event = threading.Event()
+
+    def log_message(self, *args):  # тише логи Render
+        pass
+
+    def _reply(self, code: int, body: bytes, ctype: str = "application/json; charset=utf-8",
+               extra: dict | None = None) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _json(self, code: int, payload: dict) -> None:
+        self._reply(code, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+    def _authorized(self, query: dict) -> bool:
+        if not self.key:
+            return True
+        cookie = self.headers.get("Cookie") or ""
+        if f"tgref_key={self.key}" in cookie:
+            return True
+        given = (query.get("key") or [""])[0]
+        return bool(given) and secrets.compare_digest(given, self.key)
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        path = parsed.path.rstrip("/") or "/"
+
+        if path == "/health":
+            return self._json(200, health_payload(self.cfg))
+
+        if path == "/" and (query.get("key") or [""])[0]:
+            if not self._authorized(query):
+                return self._reply(401, KEY_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            return self._reply(302, b"", "text/plain",
+                               {"Set-Cookie": f"tgref_key={self.key}; Path=/; Max-Age=31536000"})
+
+        if not self._authorized(query):
+            return self._reply(401, KEY_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+
+        if path == "/":
+            return self._reply(200, WEB_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+        if path == "/api/links":
+            return self._json(200, {"links": today_links(self.cfg)})
+        if path == "/api/status":
+            return self._json(200, {"result": build_status_text(self.cfg, self.state)})
+        return self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        path = parsed.path.rstrip("/") or "/"
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+
+        if not self._authorized(query):
+            return self._json(403, {"error": "нужен ключ доступа"})
+
+        try:
+            if path == "/api/run":
+                date_str = now_tz(self.cfg).date().isoformat()
+                state = run_daily_guard(self.cfg, date_str)
+                data = collect_stats(self.cfg, date_str)
+                return self._json(200, {"ok": state == "done", "state": state,
+                                        "report": build_report_text(data)})
+            if path == "/api/stats":
+                date_str = now_tz(self.cfg).date().isoformat()
+                data = collect_stats(self.cfg, date_str)
+                chat_id = (self.cfg.get("report_chat_id") or "").strip()
+                if chat_id:
+                    send_message(chat_id, build_report_text(data))
+                return self._json(200, {"ok": True, "report": build_report_text(data)})
+            if path == "/api/status":
+                return self._json(200, {"result": build_status_text(self.cfg, self.state)})
+        except TelegramError as exc:
+            return self._json(500, {"error": str(exc)})
+        except Exception as exc:
+            return self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
+        return self._json(404, {"error": "not found"})
+
+
+def today_links(cfg: dict) -> list[dict]:
+    date_str = now_tz(cfg).date().isoformat()
+    conn = db()
+    out = []
+    for ch in configured_channels(cfg):
+        row = link_for(conn, str(ch["chat_id"]), date_str)
+        out.append({"channel": channel_label(ch), "chat_id": ch["chat_id"],
+                    "link": row["invite_link"] if row else None,
+                    "joins": row["join_count"] if row else 0})
+    conn.close()
+    return out
+
+
+def health_payload(cfg: dict) -> dict:
+    try:
+        conn = db()
+        last = conn.execute("SELECT * FROM job_runs ORDER BY date DESC LIMIT 1").fetchone()
+        links = conn.execute("SELECT COUNT(*) AS c FROM links").fetchone()["c"]
+        conn.close()
+        last_job = dict(last) if last else None
+    except Exception as exc:
+        last_job, links = None, 0
+    return {
+        "ok": True,
+        "time": now_tz(cfg).isoformat(timespec="seconds"),
+        "token_set": token_present(cfg),
+        "channels": len(configured_channels(cfg)),
+        "links_total": links,
+        "last_job": last_job,
+    }
+
+
+def cmd_serve(cfg: dict, args) -> None:
+    """Режим Render: HTTP-сервис + бот + планировщик в одном процессе."""
+    port = int(os.environ.get("PORT") or 8080)
+    key = (cfg.get("web_key") or "").strip()
+    if not key:
+        key = secrets.token_urlsafe(16)
+        cfg["web_key"] = key
+        try:
+            save_config(cfg)
+        except OSError:
+            pass
+        log(f"⚠️  Ключ доступа сгенерирован: {key}")
+        log("   Задайте TG_WEB_KEY в переменных окружения, чтобы он не менялся при редеплое.")
+
+    if not token_present(cfg):
+        warn("Токен бота не задан (TG_BOT_TOKEN) — бот и отчёты работать не будут.")
+
+    WebHandler.cfg = cfg
+    WebHandler.key = key
+    WebHandler.state = {"bot_id": 0, "started_at": dt.datetime.now(), "restart": False}
+    WebHandler.stop_event = threading.Event()
+
+    # восстанавливаем состояние из бэкапа, если база пуста (бесплатный тариф: диск эфемерный)
+    try:
+        n = restore_state(cfg)
+        if n:
+            log(f"✅ Восстановлено из бэкапа записей: {n}")
+    except Exception as exc:
+        warn(f"Восстановление не удалось: {exc}")
+
+    threads = []
+    if os.environ.get("TG_ENABLE_BOT", "1") != "0" and token_present(cfg):
+        try:
+            me = get_me()
+            WebHandler.state["bot_id"] = me["id"]
+            t = threading.Thread(target=bot_loop, args=(cfg, WebHandler.state), daemon=True)
+            t.start()
+            threads.append(t)
+            log(f"🤖 Бот @{me['username']} запущен в фоне")
+        except TelegramError as exc:
+            warn(f"Бот не запущен: {exc}")
+    if os.environ.get("TG_ENABLE_SCHEDULER", "1") != "0":
+        t = threading.Thread(target=scheduler_loop, args=(cfg, WebHandler.stop_event), daemon=True)
+        t.start()
+        threads.append(t)
+        log("⏰ Планировщик запущен")
+
+    httpd = ThreadingHTTPServer(("0.0.0.0", port), WebHandler)
+    log(f"🌐 Слушаю 0.0.0.0:{port} — управление: http://localhost:{port}/?key={key}")
+    log(f"   Проверка состояния: /health")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        WebHandler.stop_event.set()
+        httpd.server_close()
+
+
+def cmd_worker(cfg: dict, args) -> None:
+    """Режим Render Worker: бот + планировщик без HTTP."""
+    if not token_present(cfg):
+        die("Токен бота не задан (TG_BOT_TOKEN)")
+    try:
+        n = restore_state(cfg)
+        if n:
+            log(f"✅ Восстановлено из бэкапа записей: {n}")
+    except Exception as exc:
+        warn(f"Восстановление не удалось: {exc}")
+
+    me = get_me()
+    state = {"bot_id": me["id"], "started_at": dt.datetime.now(), "restart": False}
+    stop_event = threading.Event()
+    threading.Thread(target=scheduler_loop, args=(cfg, stop_event), daemon=True).start()
+    log(f"🤖 Бот @{me['username']} запущен, планировщик работает")
+    try:
+        bot_loop(cfg, state)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+
+
 def cmd_config(cfg: dict, key: str, value: str) -> None:
     if key == "token":
         value = value.strip() or ask_secret("Токен бота (ввод скрыт): ")
@@ -1404,6 +1940,10 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("--chat", default=None)
 
     sub.add_parser("bot", help="бот-режим: /start /links /newlinks /stats")
+    sub.add_parser("serve", help="режим Render: HTTP-сервис + бот + планировщик")
+    sub.add_parser("worker", help="режим Render Worker: бот + планировщик без HTTP")
+    sub.add_parser("backup", help="сохранить состояние базы файлом в Telegram")
+    sub.add_parser("restore", help="восстановить состояние из последнего бэкапа")
 
     cf = sub.add_parser("config", help="настройки")
     cfs = cf.add_subparsers(dest="config_action", required=True)
@@ -1446,6 +1986,14 @@ def main() -> int:
             cmd_report(cfg, args)
         elif args.cmd == "bot":
             cmd_bot(cfg)
+        elif args.cmd == "serve":
+            cmd_serve(cfg, args)
+        elif args.cmd == "worker":
+            cmd_worker(cfg, args)
+        elif args.cmd == "backup":
+            cmd_backup(cfg, args)
+        elif args.cmd == "restore":
+            cmd_restore(cfg, args)
         elif args.cmd == "config":
             key = args.key if args.config_action == "set" else args.config_action
             cmd_config(cfg, key, args.value or "")

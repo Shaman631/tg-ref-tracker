@@ -17,7 +17,7 @@ API = "http://127.0.0.1:8765/bot{token}/{method}"
 TOKEN = "123:TEST"
 
 if WORK.exists():
-    shutil.rmtree(WORK)
+    shutil.rmtree(WORK, ignore_errors=True)
 WORK.mkdir(parents=True)
 shutil.copy(SRC, WORK / "tg_ref.py")
 
@@ -208,6 +208,89 @@ try:
     assert saved.get("channels"), "каналы не добавились"
     assert saved["channels"][0]["chat_id"] == "@chan111", saved["channels"]
     print("мастер: токен принят, канал добавлен, chat_id найден автоматически ✅")
+
+    print("\n=== 12. режим Render: HTTP-сервис, бэкап, восстановление ===")
+    rdir = WORK / "render"
+    rdir.mkdir(exist_ok=True)
+    shutil.copy(WORK / "tg_ref.py", rdir / "tg_ref.py")
+    (rdir / "config.json").write_text(json.dumps({
+        "bot_token": TOKEN, "report_chat_id": "999", "timezone": "Europe/Samara",
+        "schedule_time": "21:00", "web_key": "testkey",
+        "channels": [{"chat_id": "-100111", "username": "chan111", "enabled": True}],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    renv = dict(env)
+    renv["PORT"] = "8791"
+    renv["TG_REF_DB"] = str(rdir / "reflinks.db")
+    renv["TG_BACKUP_CHAT_ID"] = "999"
+    serv_log = open(rdir / "serve.log", "w", encoding="utf-8")
+    srv = subprocess.Popen([sys.executable, "tg_ref.py", "serve"], cwd=rdir, env=renv,
+                           stdout=serv_log, stderr=subprocess.STDOUT)
+
+    def http(path, method="GET", cookie=""):
+        req = urllib.request.Request(f"http://127.0.0.1:8791{path}", method=method,
+                                     headers={"Cookie": cookie})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "replace")
+
+    # ждём подъёма сервиса
+    for _ in range(40):
+        try:
+            code, _ = http("/health")
+            if code == 200:
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    code, body = http("/health")
+    assert code == 200, f"/health вернул {code}"
+    health = json.loads(body)
+    assert health.get("ok") and health.get("token_set"), health
+    print(f"/health: ok, каналов {health['channels']} ✅")
+
+    code, body = http("/")
+    assert code == 401, f"без ключа страница не должна открываться, код {code}"
+    print("страница без ключа закрыта ✅")
+
+    code, body = http("/?key=testkey")
+    assert code == 302, f"с ключом ожидался редирект, код {code}"
+    print("вход по ключу работает ✅")
+
+    code, body = http("/api/run", method="POST", cookie="tgref_key=testkey")
+    assert code == 200, f"/api/run вернул {code}: {body}"
+    result = json.loads(body)
+    assert "Итого за день" in result.get("report", ""), result
+    print("/api/run: ссылки созданы, отчёт собран ✅")
+
+    code, body = http("/api/links", cookie="tgref_key=testkey")
+    links = json.loads(body)["links"]
+    assert links and links[0]["link"], links
+    print(f"/api/links: {links[0]['link']} ✅")
+
+    # бэкап: состояние должно уехать в Telegram и восстановиться
+    code, body = http("/api/run", method="POST", cookie="tgref_key=testkey")
+    sent = mock_call("__sent")
+    dumps = [m for m in sent if m.get("method") == "sendDocument"]
+    assert dumps, "бэкап не отправился файлом в Telegram"
+    print("бэкап ушёл в Telegram файлом ✅")
+
+    # восстановление: стираем базу и просим restore
+    (rdir / "reflinks.db").unlink(missing_ok=True)
+    proc = subprocess.run([sys.executable, "tg_ref.py", "restore"], cwd=rdir, env=renv,
+                          capture_output=True, text=True, encoding="utf-8", timeout=60)
+    print(proc.stdout.strip())
+    assert "Восстановлено записей" in proc.stdout, proc.stdout + proc.stderr
+
+    srv.terminate()
+    try:
+        srv.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        srv.kill()
+    serv_log.close()
 
     print("\n✅ ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ")
 finally:
