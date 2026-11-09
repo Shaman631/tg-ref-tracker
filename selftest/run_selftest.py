@@ -182,6 +182,33 @@ try:
         phone.kill()
         raise AssertionError("бот не завершился после /restart")
 
+    print("\n=== 11. мастер настройки: токен скрыто, каналы, авто-поиск chat_id ===")
+    # сообщение /start, которое «пользователь» отправил боту
+    mock_call("__push_update", {"update": {"update_id": 950, "message": {
+        "chat": {"id": 555, "type": "private", "first_name": "Тест"},
+        "text": "/start"}}})
+    # отдельная папка, чтобы мастер не мешал основной конфигурации
+    wiz = WORK / "wizard_test"
+    wiz.mkdir(exist_ok=True)
+    shutil.copy(WORK / "tg_ref.py", wiz / "tg_ref.py")
+    (wiz / "config.json").write_text(json.dumps({
+        "bot_token": TOKEN, "report_chat_id": "", "timezone": "Europe/Samara",
+        "schedule_time": "21:00", "channels": [],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    proc = subprocess.run([sys.executable, "tg_ref.py", "wizard"], cwd=wiz, env=env,
+                          input="@chan111\n", capture_output=True, text=True,
+                          encoding="utf-8", timeout=90)
+    print(proc.stdout.strip())
+    if proc.returncode != 0:
+        print(proc.stderr.strip())
+    assert proc.returncode == 0, "мастер настройки завершился с ошибкой"
+    saved = json.loads((wiz / "config.json").read_text(encoding="utf-8"))
+    assert saved.get("report_chat_id") == "555", f"chat_id не найден: {saved}"
+    assert saved.get("channels"), "каналы не добавились"
+    assert saved["channels"][0]["chat_id"] == "@chan111", saved["channels"]
+    print("мастер: токен принят, канал добавлен, chat_id найден автоматически ✅")
+
     print("\n✅ ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ")
 finally:
     mock.terminate()

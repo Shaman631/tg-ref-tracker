@@ -77,24 +77,45 @@ bash deploy/setup-termux.sh
 шаблона, пропишет crontab (ежечасная догоняющая проверка + watchdog бота каждые 10 минут),
 запустит cron и бота, а также создаст скрипт автозапуска `~/.termux/boot/run-tg-ref.sh`.
 
-### Шаг 4. Заполните настройки
+### Шаг 4. Настройка (токен вводится со скрытием)
 
 ```bash
 cd ~/tg-ref-tracker
-nano config.json          # bot_token, report_chat_id, channels
+python tg_ref.py wizard
 ```
 
-- `bot_token` — токен из @BotFather;
-- `report_chat_id` — ваш chat_id: напишите боту `/start`, он ответит своим id;
-- `channels` — список каналов (`@username` или `-100xxxxxxxxxx`).
+Мастер задаст 5 вопросов:
+
+1. **Токен бота** — вводится со скрытием (символы не отображаются, в историю команд не попадает).
+2. Проверит токен и покажет username вашего бота.
+3. **Каналы** — введите через запятую: `@my_channel, @second_channel`.
+4. **Куда присылать отчёты** — мастер сам найдёт ваш `chat_id`: напишите боту `/start`
+   в Telegram, и он подхватит сообщение. Если бот уже запущен, мастер на секунду
+   остановит его, чтобы не забрать ваше сообщение, и поднимет обратно.
+5. Итоговая проверка прав по каждому каналу.
 
 Бот должен быть **администратором** каждого канала с правом «Приглашать пользователей»
 (Управление каналом → Администраторы → Добавить).
+
+### Как не засветить токен
+
+- **Никогда не присылайте токен в чат** — ни в этот чат, ни в Telegram-группу, ни в
+  issues. Переписка сохраняется, и токен утечёт. Вводите его только на самом устройстве.
+- В мастере ввод скрыт: символы не echoes на экране и не попадают в `~/.bash_history`.
+- Токен лежит в `config.json` с правами `600` (доступен только вашему пользователю Termux).
+- `config.json` добавлен в `.gitignore` — в репозиторий токен не попадёт. Шаблон без
+  токена лежит рядом в `config.example.json`.
+- Если не хотите держать токен в файле — задайте переменную окружения
+  `export TG_BOT_TOKEN=...` в `~/.bashrc`; она перекрывает значение из `config.json`.
+- Сменить токен поздно можно безопасно: `python tg_ref.py config set token` — снова
+  спросит скрыто, старый перезапишется.
+- Утечка? Отзовите токен в @BotFather (`/revoke`) и впишите новый через мастер.
 
 ### Шаг 5. Проверьте и запустите первый раз
 
 ```bash
 python tg_ref.py setup        # токен и права по каждому каналу
+python tg_ref.py wizard       # если настройка нужна с нуля (токен вводится скрыто)
 ./deploy/daily.sh             # создать ссылки дня и прислать отчёт
 ```
 
@@ -134,9 +155,7 @@ python tg_ref.py setup        # токен и права по каждому к�
 
 ```powershell
 cd E:\tg
-python tg_ref.py config set token <ТОКЕН>
-python tg_ref.py config set chat <ВАШ_CHAT_ID>
-python tg_ref.py channels add @ваш_канал
+python tg_ref.py wizard        # мастер настройки, токен вводится скрыто
 python tg_ref.py setup          # проверка прав
 python tg_ref.py daily --send   # создать ссылки и прислать отчёт
 ```
@@ -220,10 +239,16 @@ chmod +x deploy/*.sh
 
 ```bash
 cd /home/USER/tg
-python3 tg_ref.py config set token 7123456789:AAH...
-python3 tg_ref.py config set chat 123456789
+python3 tg_ref.py wizard
+```
+
+Мастер спросит токен (ввод скрыт), каналы и сам найдёт ваш `chat_id` по команде `/start`.
+Либо по отдельности:
+
+```bash
+python3 tg_ref.py config set token      # спросит скрыто
+python3 tg_ref.py config set chat        # спросит chat_id
 python3 tg_ref.py channels add @my_channel
-python3 tg_ref.py channels add -1001234567890
 ```
 
 Права на файл с токеном:
@@ -313,6 +338,8 @@ tail -n 40 logs/daily.log
 | `python3 tg_ref.py report --date 2026-11-08` | переслать сохранённый отчёт за дату |
 | `python3 tg_ref.py channels list` | список каналов |
 | `python3 tg_ref.py health` | диагностика окружения и настроек |
+| `python3 tg_ref.py wizard` | пошаговая настройка, токен вводится со скрытием |
+| `python3 tg_ref.py config set token` | ввести/сменить токен (скрытый ввод) |
 | `python3 tg_ref.py bot` | бот-режим (обычно запускается через `botctl.sh`) |
 | `python3 tg_ref.py config set schedule 21:00` | изменить время автосоздания |
 

@@ -1144,33 +1144,179 @@ def cmd_report(cfg: dict, args) -> None:
     log(f"Отчёт за {date_str} отправлен в чат {chat_id}")
 
 
+def ask_secret(prompt: str) -> str:
+    """Ввод с скрытием символов — чтобы токен не светился на экране."""
+    try:
+        import getpass
+        return getpass.getpass(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        return ""
+    except Exception:
+        return input(prompt).strip()
+
+
+def find_private_chat_id(timeout: int = 90) -> tuple[str | None, str]:
+    """Ищет ваш личный чат по команде /start, которую вы отправили боту."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            updates = api_call("getUpdates", {"timeout": 5, "limit": 50}) or []
+        except TelegramError:
+            return None, ""
+        for upd in updates:
+            msg = upd.get("message")
+            if not msg:
+                continue
+            chat = msg.get("chat", {})
+            if chat.get("type") == "private" and chat.get("id"):
+                who = chat.get("first_name") or chat.get("username") or ""
+                return str(chat["id"]), who
+        time.sleep(1)
+    return None, ""
+
+
+def cmd_wizard(cfg: dict, args) -> None:
+    """Пошаговая настройка с терминала: токен вводится со скрытием, всё остальное — по подсказкам."""
+    log("╔══════════════════════════════════════════╗")
+    log("║   Настройка трекера реферальных ссылок     ║")
+    log("╚══════════════════════════════════════════╝")
+
+    # 1. Токен
+    token = (os.environ.get("TG_BOT_TOKEN") or cfg.get("bot_token") or "").strip()
+    if token:
+        log("\n[1/5] Токен уже задан (переменная окружения или config.json)")
+    else:
+        log("\n[1/5] Токен бота от @BotFather")
+        log("      Ввод будет скрыт — символы не отображаются.")
+        token = ask_secret("      Вставьте токен и нажмите Enter: ")
+        if not token:
+            die("Токен не введён")
+        cfg["bot_token"] = token
+        save_config(cfg)
+        try:
+            os.chmod(CONFIG_PATH, 0o600)
+        except OSError:
+            pass
+
+    # 2. Проверка токена
+    log("\n[2/5] Проверяю токен…")
+    try:
+        me = get_me()
+    except TelegramError as exc:
+        die(f"Токен не работает: {exc}")
+    log(f"      ✅ Бот @{me['username']} (id {me['id']})")
+
+    # 3. Каналы
+    log("\n[3/5] Каналы")
+    log("      Укажите каналы через запятую, например: @my_channel, @second_channel")
+    log("      (пробелы не важны; Enter — пропустить и добавить позже)")
+    try:
+        raw = input("      Каналы: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raw = ""
+    names = [n.strip().lstrip("@") for n in raw.replace(";", ",").split(",") if n.strip()]
+    for name in names:
+        try:
+            cmd_channels(cfg, argparse.Namespace(action="add", chat_id=f"@{name}", title=None))
+        except Exception as exc:
+            warn(f"      Не удалось добавить @{name}: {exc}")
+    if not names:
+        log("      Каналы не заданы — добавить позже: python tg_ref.py channels add @имя")
+
+    log("      Не забудьте: Управление каналом → Администраторы → добавить бота")
+    log("      с правом «Приглашать пользователей».")
+
+    # 4. chat_id
+    log("\n[4/5] Куда присылать отчёты")
+    chat_id = (cfg.get("report_chat_id") or "").strip()
+    if chat_id:
+        log(f"      Уже задан: {chat_id}")
+    else:
+        log("      Напишите боту /start в Telegram — я найду ваш chat_id сам.")
+        bot_running = (BASE_DIR / ".bot.pid").exists()
+        if bot_running:
+            log("      (бот временно останавливается, чтобы не забрать ваше сообщение)")
+            try:
+                pid = int((BASE_DIR / ".bot.pid").read_text(encoding="utf-8").strip())
+                os.kill(pid, 15)
+                time.sleep(1)
+            except (OSError, ValueError):
+                pass
+        try:
+            found, who = find_private_chat_id(timeout=90)
+        finally:
+            if bot_running:
+                subprocess_start_bot()
+        if found:
+            cfg["report_chat_id"] = found
+            save_config(cfg)
+            log(f"      ✅ Нашёл: {found}" + (f" ({who})" if who else ""))
+        else:
+            log("      ⚠️  Не нашёл сообщение. Напишите боту /start и выполните:")
+            log("         python tg_ref.py config set chat")
+
+    # 5. Итог
+    log("\n[5/5] Итоговая проверка")
+    cmd_setup(cfg)
+    log("")
+    log("Готово. Первый отчёт прямо сейчас:")
+    log("   python tg_ref.py daily --send")
+    log("А в Telegram бот ответит на /daily, /stats, /status, /restart.")
+
+
+def subprocess_start_bot() -> None:
+    """Поднимает бота в фоне (используется мастером настройки)."""
+    try:
+        import subprocess
+        logf = open(BASE_DIR / "logs" / "bot.log", "a", encoding="utf-8")
+        subprocess.Popen([sys.executable, "tg_ref.py", "bot"], cwd=str(BASE_DIR),
+                         stdout=logf, stderr=subprocess.STDOUT)
+    except Exception as exc:
+        warn(f"Не удалось запустить бота: {exc}")
+
+
 def cmd_config(cfg: dict, key: str, value: str) -> None:
     if key == "token":
-        cfg["bot_token"] = value.strip()
+        value = value.strip() or ask_secret("Токен бота (ввод скрыт): ")
+        if not value:
+            die("Пустой токен")
+        cfg["bot_token"] = value
         save_config(cfg)
-        log("✅ Токен сохранён в config.json")
+        try:
+            os.chmod(CONFIG_PATH, 0o600)
+        except OSError:
+            pass
+        log("✅ Токен сохранён в config.json (права 600)")
     elif key == "chat":
-        cfg["report_chat_id"] = value.strip()
+        value = value.strip() or input("Ваш chat_id (напишите боту /start, он ответит): ").strip()
+        if not value:
+            die("Пустой chat_id")
+        cfg["report_chat_id"] = value
         save_config(cfg)
         log("✅ chat_id для отчётов сохранён")
     elif key == "schedule":
+        value = value.strip() or input("Время автосоздания (ЧЧ:ММ): ").strip()
         hh, mm = parse_time_hm(value)
         cfg["schedule_time"] = f"{hh:02d}:{mm:02d}"
         save_config(cfg)
         log(f"✅ Время автосоздания ссылок: {hh:02d}:{mm:02d} ({cfg.get('timezone')})")
     elif key == "timezone":
-        cfg["timezone"] = value.strip()
+        value = value.strip() or input("Часовой пояс (Europe/Samara): ").strip()
+        cfg["timezone"] = value
         save_config(cfg)
         log(f"✅ Таймзона: {cfg['timezone']}")
     elif key == "member_limit":
+        value = value.strip() or input("Лимит участников на ссылку (0 = нет): ").strip()
         cfg["member_limit"] = int(value)
         save_config(cfg)
         log(f"✅ Лимит участников на ссылку: {cfg['member_limit'] or 'без лимита'}")
     elif key == "expire":
+        value = value.strip() or input("Срок жизни ссылки в часах (0 = бессрочно): ").strip()
         cfg["link_expire_hours"] = int(value)
         save_config(cfg)
         log(f"✅ Срок жизни ссылки: {cfg['link_expire_hours'] or 'бессрочно'} ч")
     elif key == "utc_offset":
+        value = value.strip() or input("Смещение часового пояса (напр. 4): ").strip()
         cfg["utc_offset"] = int(value)
         save_config(cfg)
         log(f"✅ Запасное смещение часового пояса: UTC+{cfg['utc_offset']}")
@@ -1211,6 +1357,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("init", help="создать config.json и базу")
     sub.add_parser("setup", help="проверить токен, права и настройки")
     sub.add_parser("chatid", help="узнать свой chat_id для отчётов")
+    sub.add_parser("wizard", help="пошаговая настройка: токен вводится со скрытием")
 
     d = sub.add_parser("discover", help="найти каналы, где бот админ")
     d.add_argument("--save", action="store_true", help="дописать найденные каналы в config.json")
@@ -1267,10 +1414,10 @@ def build_parser() -> argparse.ArgumentParser:
                     ("utc_offset", "смещение часового пояса (запасной вариант, напр. 4)"))
     for key, helptext in config_keys:
         sp = cfs.add_parser(key, help=helptext)
-        sp.add_argument("value")
+        sp.add_argument("value", nargs="?", default="")
     sp_set = cfs.add_parser("set", help="config set <ключ> <значение> — тот же синтаксис")
     sp_set.add_argument("key", choices=[k for k, _ in config_keys])
-    sp_set.add_argument("value")
+    sp_set.add_argument("value", nargs="?", default="")
     return p
 
 
@@ -1301,7 +1448,9 @@ def main() -> int:
             cmd_bot(cfg)
         elif args.cmd == "config":
             key = args.key if args.config_action == "set" else args.config_action
-            cmd_config(cfg, key, args.value)
+            cmd_config(cfg, key, args.value or "")
+        elif args.cmd == "wizard":
+            cmd_wizard(cfg, args)
         elif args.cmd == "chatid":
             cmd_chatid(cfg)
     except TelegramError as exc:
