@@ -292,6 +292,22 @@ try:
         srv.kill()
     serv_log.close()
 
+    print("\n=== 13. ключ доступа стабилен между перезапусками ===")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("tgref_mod", rdir / "tg_ref.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    cfg_a = {"bot_token": TOKEN, "web_key": ""}
+    cfg_b = {"bot_token": TOKEN, "web_key": ""}
+    k1 = mod.web_key_for(cfg_a)
+    k2 = mod.web_key_for(cfg_b)
+    assert k1 == k2 and len(k1) >= 16, f"ключ нестабилен: {k1} vs {k2}"
+    other = mod.web_key_for({"bot_token": "другой:токен", "web_key": ""})
+    assert other != k1, "ключ не зависит от токена"
+    explicit = mod.web_key_for({"bot_token": TOKEN, "web_key": "мой-ключ"})
+    assert explicit == "мой-ключ", explicit
+    print(f"ключ производный от токена и не меняется: {k1[:12]}… ✅")
+
     print("\n✅ ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ")
 finally:
     mock.terminate()

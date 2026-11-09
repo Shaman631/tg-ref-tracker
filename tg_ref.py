@@ -624,6 +624,7 @@ def bot_commands_help() -> str:
         "/links — ссылки дня по каналам\n"
         "/newlinks — создать ссылки дня вручную\n"
         "/status — состояние системы (аптайм, ближайший запуск, последний отчёт)\n"
+        "/webkey — ключ доступа к веб-странице управления\n"
         "/restart — перезапустить бота (поднимет watchdog)\n"
         "/channels — список каналов и статус прав\n"
         "/help — эта справка\n\n"
@@ -806,6 +807,16 @@ def handle_bot_update(update: dict, cfg: dict, state: dict) -> None:
             send_message(chat_id, build_report_text(data), reply_markup=main_keyboard())
         elif cmd == "/status":
             send_message(chat_id, build_status_text(cfg, state), reply_markup=main_keyboard())
+        elif cmd == "/webkey":
+            key = web_key_for(cfg)
+            public = (os.environ.get("TG_PUBLIC_URL")
+                      or os.environ.get("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+            url = f"{public}/?key={key}" if public else f"/?key={key}"
+            send_message(chat_id,
+                         "🔑 Ключ доступа к веб-странице управления\n\n"
+                         f"<code>{key}</code>\n\n"
+                         f"Страница: {url}\n\n"
+                         "Сохраните ссылку в закладки телефона.")
         elif cmd == "/restart":
             send_message(chat_id,
                          "🔄 Перезапускаю бота. Watchdog поднимет его в течение минуты.\n"
@@ -1722,25 +1733,45 @@ def health_payload(cfg: dict) -> dict:
         "ok": True,
         "time": now_tz(cfg).isoformat(timespec="seconds"),
         "token_set": token_present(cfg),
+        "report_chat_set": bool((cfg.get("report_chat_id") or "").strip()),
+        "backup_chat_set": bool((cfg.get("backup_chat_id") or "").strip()),
+        "schedule_time": cfg.get("schedule_time"),
         "channels": len(configured_channels(cfg)),
         "links_total": links,
         "last_job": last_job,
     }
 
 
+def web_key_for(cfg: dict) -> str:
+    """Ключ доступа к веб-странице.
+
+    Порядок: явный TG_WEB_KEY → производный от токена (стабильный между
+    перезапусками Render) → случайный.
+    """
+    key = (cfg.get("web_key") or "").strip()
+    if key:
+        return key
+    token = (cfg.get("bot_token") or "").strip()
+    if token:
+        import hashlib
+        return hashlib.sha256(("tg-ref-web:" + token).encode("utf-8")).hexdigest()[:32]
+    return secrets.token_urlsafe(16)
+
+
 def cmd_serve(cfg: dict, args) -> None:
     """Режим Render: HTTP-сервис + бот + планировщик в одном процессе."""
     port = int(os.environ.get("PORT") or 8080)
-    key = (cfg.get("web_key") or "").strip()
-    if not key:
-        key = secrets.token_urlsafe(16)
+    key = web_key_for(cfg)
+    if not (cfg.get("web_key") or "").strip() and token_present(cfg):
+        log("   Ключ доступа выведен из токена — он не меняется при перезапусках.")
+    elif not (cfg.get("web_key") or "").strip():
+        warn("TG_WEB_KEY не задан и токена нет — сгенерирован временный ключ, "
+             "он сменится при перезапуске.")
         cfg["web_key"] = key
         try:
             save_config(cfg)
         except OSError:
             pass
-        log(f"⚠️  Ключ доступа сгенерирован: {key}")
-        log("   Задайте TG_WEB_KEY в переменных окружения, чтобы он не менялся при редеплое.")
 
     if not token_present(cfg):
         warn("Токен бота не задан (TG_BOT_TOKEN) — бот и отчёты работать не будут.")
@@ -1776,8 +1807,11 @@ def cmd_serve(cfg: dict, args) -> None:
         log("⏰ Планировщик запущен")
 
     httpd = ThreadingHTTPServer(("0.0.0.0", port), WebHandler)
-    log(f"🌐 Слушаю 0.0.0.0:{port} — управление: http://localhost:{port}/?key={key}")
-    log(f"   Проверка состояния: /health")
+    log(f"🌐 Служаю 0.0.0.0:{port}")
+    log(f"🔑 Ключ доступа: {key}")
+    log(f"   Страница управления: /?key={key}")
+    log("   Проверка состояния: /health")
+    log("   Команда /webkey в Telegram покажет этот же ключ")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

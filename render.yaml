@@ -20,13 +20,16 @@ services:
       - key: TG_CHANNELS
         sync: false        # например: @my_channel,@second_channel
       - key: TG_WEB_KEY
-        generateValue: true # ключ для веб-страницы управления
+        sync: false        # необязательно: если пусто, ключ выводится из токена
+                           # и не меняется при перезапусках
       - key: TG_SCHEDULE_TIME
         value: "21:00"
       - key: TG_TIMEZONE
         value: Europe/Samara
       - key: TG_BACKUP_CHAT_ID
         sync: false        # чат для бэкапа базы (обычно тот же, что и report_chat_id)
+      - key: TG_PUBLIC_URL
+        sync: false        # необязательно: Render сам подставляет RENDER_EXTERNAL_URL
       - key: PYTHONUNBUFFERED
         value: "1"
 
