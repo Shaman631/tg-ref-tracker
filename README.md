@@ -119,6 +119,96 @@ https://<имя-сервиса>.onrender.com/health
 
 ---
 
+## Виртуальный хостинг
+
+Три варианта — от простого к гибкому. Везде работает одна и та же логика: три PHP-файла,
+без Composer, без крона в коде.
+
+### Вариант 1. Обычный шаред-хостинг (cPanel, Plesk)
+
+Долгоживущий процесс там запрещён, поэтому ежедневную задачу поднимает **панельный крон
+одной строкой** — это единственный крон, и он вне кода.
+
+1. Залейте на сервер файлы `index.php`, `worker.php`, `lib.php`, `cron.php` — например в
+   `~/www/tracker/`. Если хотите, чтобы работал только веб-интерфейс, `worker.php` не
+   нужен вовсе.
+2. Создайте рядом с ними `config.local.php`:
+
+   ```bash
+   cp config.local.example.php config.local.php
+   nano config.local.php     # впишите BOT_TOKEN, CHAT_ID, CHANNELS
+   ```
+
+   Переменные окружения недоступны на шаред-хостинге, поэтому настройки лежат в файле.
+   Он в `.gitignore` — токен в репозиторий не попадёт.
+
+3. В панели добавьте **Cron Job** (раз в час — он сам дождётся нужного времени):
+
+   ```
+   php /home/USER/www/tracker/cron.php
+   ```
+
+   Скрипт ничего не делает, пока не наступит `SCHEDULE_TIME` и если отчёт за день уже
+   отправлен. Как только время пришло — создаёт ссылки, снимает статистику и шлёт отчёт.
+
+4. Проверьте в браузере `https://ваш-домен/tracker/?key=...`. Ключ возьмите из панели
+   (логи) или из `config.local.php` (`WEB_KEY`).
+
+**Про бота в Telegram на шаред-хостинге:** долгоживущего процесса нет, поэтому команды
+`/daily`, `/links`, `/status` отвечать не будут. Отчёты приходят по крону — этого обычно
+достаточно. Если нужны и команды, и веб-страница с кнопкой — переходите на VPS.
+
+### Вариант 2. VPS без Docker (Ubuntu/Debian)
+
+Nginx + встроенный сервер PHP + две systemd-службы.
+
+```bash
+sudo bash deploy/install-vps.sh
+nano /etc/tg-ref.env          # BOT_TOKEN, CHAT_ID, CHANNELS
+sudo systemctl restart tg-ref-web tg-ref-worker
+curl http://127.0.0.1:8080/health
+```
+
+Скрипт установки сам ставит nginx и php-cli, копирует проект в `/opt/tg-ref`, создаёт
+`/etc/tg-ref.env` (права 600) и systemd-службы:
+
+- `tg-ref-web.service` — веб на `127.0.0.1:8080`, проксируется nginx;
+- `tg-ref-worker.service` — воркер: команды Telegram **и** расписание.
+
+Домен: впишите его в `deploy/nginx.conf`, затем
+
+```bash
+sudo cp deploy/nginx.conf /etc/nginx/sites-available/tg-ref
+sudo ln -sf /etc/nginx/sites-available/tg-ref /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Состояние лежит в `/var/lib/tg-ref/state.json` и переживает перезагрузки.
+
+### Вариант 3. VPS с Docker — самый короткий путь
+
+```bash
+cp deploy/tg-ref.env.example .env    # впишите значения
+mkdir -p data
+docker compose up -d --build
+curl http://127.0.0.1:8080/health
+```
+
+Dockerfile и `docker-compose.yml` уже в репозитории; порт проксируется на локальный
+`127.0.0.1:8080`, наружу — через nginx или Caddy.
+
+### Настройки: где что задавать
+
+| Способ | Где задаются настройки |
+|---|---|
+| Render | переменные окружения сервиса |
+| Шаред-хостинг | `config.local.php` рядом с кодом |
+| VPS | `/etc/tg-ref.env` (или `config.local.php`) |
+
+Приоритет: **переменная окружения → `config.local.php` → значение по умолчанию**.
+
+---
+
 ## Команды бота в Telegram
 
 | Команда | Что делает |
@@ -145,6 +235,8 @@ export STATE_FILE=./state.json
 php worker.php &                      # воркер: команды + расписание
 php -S 127.0.0.1:8080 index.php       # веб-страница
 ```
+
+Или без переменных окружения — положите настройки в `config.local.php`.
 
 Страница — `http://127.0.0.1:8080/?key=<ключ>`; ключ выводится в консоль при старте.
 
@@ -181,8 +273,12 @@ python php-selftest.py
 | `index.php` | веб-страница управления и ручной запуск задачи |
 | `worker.php` | демон: команды Telegram + расписание без крона |
 | `lib.php` | Telegram API, состояние, подсчёт прироста, отчёт |
+| `cron.php` | точка входа для крона хостинга (`php cron.php`, опционально `--force`) |
+| `config.local.example.php` | шаблон настроек для шаред-хостинга → `config.local.php` |
 | `render.yaml` | Blueprint для Render (Docker, бесплатный план) |
 | `Dockerfile` | образ `php:8.3-cli` без расширений и зависимостей |
+| `docker-compose.yml` | запуск на VPS одной командой |
+| `deploy/` | установка на VPS: systemd-службы, nginx, `install-vps.sh` |
 | `php-selftest.py` | сквозная проверка на моке Telegram API |
 | `mock_bot_api.py` | локальный мок Telegram API |
 | `python/` | предыдущая версия на Python (Termux, Windows) — см. `python/README.md` |

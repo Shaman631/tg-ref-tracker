@@ -1,0 +1,19 @@
+[Unit]
+Description=Telegram referral tracker — worker (команды Telegram и расписание)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/tg-ref
+EnvironmentFile=-/etc/tg-ref.env
+ExecStart=/usr/bin/php /opt/tg-ref/worker.php
+Restart=always
+RestartSec=5
+# Мягкая остановка, чтобы воркер успел убрать файл состояния
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

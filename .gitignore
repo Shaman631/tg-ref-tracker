@@ -1,5 +1,6 @@
 # Настройки и секреты — токен бота и chat_id
 config.json
+config.local.php
 .env
 
 # Данные прогона

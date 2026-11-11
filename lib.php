@@ -9,10 +9,41 @@ declare(strict_types=1);
 const DEFAULT_TZ = 'Europe/Samara';
 const DEFAULT_SCHEDULE = '21:00';
 
+/**
+ * Настройки из файла config.local.php (если он есть).
+ * Нужен там, где переменные окружения задать нельзя — обычный виртуальный хостинг.
+ * Файл возвращает массив вида ['BOT_TOKEN' => '...', 'CHANNELS' => '@a,@b'].
+ */
+function localConfig(): array
+{
+    static $cfg = null;
+    if ($cfg === null) {
+        $cfg = [];
+        $file = __DIR__ . '/config.local.php';
+        if (is_file($file)) {
+            $data = @include $file;
+            if (is_array($data)) {
+                $cfg = $data;
+            }
+        }
+    }
+    return $cfg;
+}
+
+/**
+ * Значение настройки: сначала переменная окружения, потом config.local.php.
+ */
 function env(string $key, ?string $default = null): ?string
 {
     $v = getenv($key);
-    return ($v === false || $v === '') ? $default : $v;
+    if ($v !== false && $v !== '') {
+        return $v;
+    }
+    $local = localConfig();
+    if (isset($local[$key]) && $local[$key] !== '' && $local[$key] !== null) {
+        return (string) $local[$key];
+    }
+    return $default;
 }
 
 function tz(): DateTimeZone

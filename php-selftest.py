@@ -149,6 +149,31 @@ try:
     assert "testkey" in key_msg, key_msg
     print("/webkey: ключ отправлен ✅")
 
+    print("\n=== 7. настройки без переменных окружения (config.local.php) ===")
+    # отдельная копия приложения, где настройки лежат в файле — как на шаред-хостинге
+    local = WORK / "local"
+    local.mkdir(exist_ok=True)
+    for f in ("index.php", "worker.php", "lib.php", "cron.php"):
+        shutil.copy(HERE / f, local / f)
+    (local / "config.local.php").write_text(
+        "<?php return ['BOT_TOKEN' => '%s', 'CHAT_ID' => '999', 'CHANNELS' => '@chan111',"
+        " 'SCHEDULE_TIME' => '21:00', 'TZ' => 'Europe/Samara',"
+        " 'STATE_FILE' => __DIR__ . '/state.json'];" % TOKEN,
+        encoding="utf-8")
+    lenv = dict(os.environ)
+    for k in ("BOT_TOKEN", "CHAT_ID", "CHANNELS", "WEB_KEY", "STATE_FILE", "SCHEDULE_TIME", "TZ"):
+        lenv.pop(k, None)
+    lenv["TELEGRAM_API"] = API
+
+    proc = subprocess.run(["php", "cron.php", "--force"], cwd=local, env=lenv, capture_output=True,
+                          text=True, encoding="utf-8", timeout=60)
+    print(proc.stdout.strip() or proc.stderr.strip())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    state = json.loads((local / "state.json").read_text(encoding="utf-8"))
+    assert len(state["channels"]) == 1, state
+    assert "@chan111" in state["channels"], state
+    print("config.local.php: канал найден без переменных окружения ✅")
+
     print("\n✅ ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ")
 finally:
     for p in (worker, web):

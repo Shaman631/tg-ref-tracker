@@ -1,0 +1,18 @@
+# Самый простой способ на VPS: docker compose up -d
+# Перед стартом создайте .env рядом с этим файлом:
+#   cp deploy/tg-ref.env.example .env  (и впишите значения)
+services:
+  app:
+    build: .
+    container_name: tg-ref
+    restart: always
+    env_file:
+      - .env
+    environment:
+      PORT: "8080"
+      TZ: Europe/Samara
+      STATE_FILE: /data/state.json
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./data:/data
